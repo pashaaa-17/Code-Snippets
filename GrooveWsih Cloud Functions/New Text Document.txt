@@ -1,0 +1,120 @@
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+admin.initializeApp();
+
+const db = admin.firestore();
+
+// eslint-disable-next-line max-len
+exports.updateActiveSessions = functions.pubsub.schedule("every 10 minutes").onRun(async (context) => {
+  const currentTimestamp = admin.firestore.Timestamp.now();
+  const oneMonthInSeconds = 30 * 24 * 60 * 60;
+
+  try {
+    // Query active sessions
+    const activeSessionsSnapshot = await db.collection("sessions")
+        .where("start_time", "<=", currentTimestamp)
+        .where("end_time", ">=", currentTimestamp)
+        .get();
+
+    if (activeSessionsSnapshot.empty) {
+      console.log("No active sessions found");
+    } else {
+      // Iterate over each found session document
+      activeSessionsSnapshot.forEach(async (sessionDoc) => {
+        const sessionData = sessionDoc.data();
+        const djRef = sessionData.dj_ref;
+
+        await sessionDoc.ref.update({
+          is_live: true
+        });
+
+        // Add the session document reference
+        // to the dj_ref's active_session field
+        await djRef.update({
+          active_session: sessionDoc.ref,
+        });
+
+        // eslint-disable-next-line max-len
+        console.log(`Updated DJ document ${djRef.id} with active session ${sessionDoc.id}`);
+      });
+    }
+
+    // Query expired sessions (within the last 10 minutes)
+    const tenMinutesAgo = admin.firestore.Timestamp.fromMillis(
+        currentTimestamp.toMillis() - 10 * 60 * 1000,
+    );
+    const expiredSessionsSnapshot = await db.collection("sessions")
+        .where("end_time", "<", currentTimestamp)
+        .where("end_time", ">", tenMinutesAgo)
+        .get();
+
+    if (expiredSessionsSnapshot.empty) {
+      console.log("No expired sessions found");
+    } else {
+      // Iterate over each expired session document
+      expiredSessionsSnapshot.forEach(async (sessionDoc) => {
+        const sessionData = sessionDoc.data();
+        const djRef = sessionData.dj_ref;
+
+        await sessionDoc.ref.update({
+          is_live: false
+        });
+
+        // Remove the session document reference
+        // from the dj_ref's active_session field
+        await djRef.update({
+          active_session: admin.firestore.FieldValue.delete(),
+        });
+
+        // Find all requests related to the expiring session
+        const requestsSnapshot = await db.collection("requests")
+            .where("session_ref", "==", sessionDoc.ref)
+            .get();
+
+        if (!requestsSnapshot.empty) {
+          // Update the status of all related requests to 'Incomplete'
+          const batch = db.batch();
+          requestsSnapshot.forEach((requestDoc) => {
+            batch.update(requestDoc.ref, {status: "Incomplete"});
+
+            // Create a notification document to notify the DJ
+            const djNotification = {
+              notification_type: "Session",
+              dj_ref: djRef,
+              user_refs: djRef.path,
+              is_read: false,
+              timestamp: currentTimestamp,
+              notification_title: "Session Ended",
+              // eslint-disable-next-line max-len
+              notification_text: "Your session has ended, thank you for using GrooveWish Pro",
+              initial_page_name: "sessionDetails",
+              notification_sound: "default",
+              request_ref: requestDoc.ref,
+              parameter_data: `{"sessionRef":"/sessions/${sessionDoc.id}"}`,
+              target_audience: "all",
+              time_to_live: new admin.firestore.Timestamp(
+                  currentTimestamp.seconds + oneMonthInSeconds,
+                  currentTimestamp.nanoseconds,
+              ),
+              recipient: djRef.id,
+              // eslint-disable-next-line max-len
+              content: "Your session has ended, thank you for using GrooveWish Pro.",
+            };
+
+            db.collection("notifications").add(djNotification);
+          });
+          await batch.commit();
+          // eslint-disable-next-line max-len
+          console.log(`Updated status of requests related to session ${sessionDoc.id} to 'Incomplete' and created notifications`);
+        }
+
+        // eslint-disable-next-line max-len
+        console.log(`Removed expired session ${sessionDoc.id} from DJ document ${djRef.id}`);
+      });
+    }
+  } catch (error) {
+    console.error("Error updating active and expired sessions:", error);
+  }
+
+  return null;
+});
